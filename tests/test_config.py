@@ -129,6 +129,11 @@ class ConfigStoreTests(unittest.TestCase):
             config_path = root / "config.json"
             cache_path = root / "service_cache.json"
             save_config(AppConfig(username="user", password="secret"), config_path)
+            raw = config_path.read_text(encoding="utf-8")
+            self.assertNotIn('"password":', raw)
+            self.assertNotIn("secret", raw)
+            self.assertIn('"password_dpapi":', raw)
+            self.assertEqual(load_config(config_path).password, "secret")
             with patch("sysu_netauth.core.config.SERVICE_CACHE_PATH", cache_path):
                 save_service_cache(
                     ServiceCache(iface="Ethernet", last_success_mac="00:11")

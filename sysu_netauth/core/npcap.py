@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import ctypes.util
+import json
 import os
+import subprocess
 import urllib.request
 
 NPCAP_DOWNLOAD_URL = "https://npcap.com/#download"
@@ -41,14 +43,65 @@ def explain_npcap_requirement() -> str:
     )
 
 
+def _check_authenticode_signature(path: str) -> tuple[bool, str]:
+    """Require a valid Microsoft Authenticode signature from Nmap Software LLC."""
+    powershell = os.path.join(
+        os.environ.get("WINDIR", r"C:\Windows"),
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+    )
+    if not os.path.isfile(powershell):
+        return False, "无法找到 Windows PowerShell，不能验证数字签名"
+    env = os.environ.copy()
+    env["SYSUNETAUTH_VERIFY_FILE"] = os.path.abspath(path)
+    command = (
+        "$s=Get-AuthenticodeSignature -LiteralPath $env:SYSUNETAUTH_VERIFY_FILE;"
+        "@{Status=[string]$s.Status;Subject=[string]$s.SignerCertificate.Subject}"
+        "|ConvertTo-Json -Compress"
+    )
+    try:
+        result = subprocess.run(
+            [
+                powershell,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=env,
+            creationflags=0x08000000,
+        )
+        if result.returncode != 0:
+            return False, "数字签名验证工具执行失败"
+        signature = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return False, f"数字签名验证失败：{exc}"
+    status = str(signature.get("Status", ""))
+    subject = str(signature.get("Subject", ""))
+    if status != "Valid":
+        return False, f"Npcap 安装程序数字签名无效（{status or 'Unknown'}）"
+    if "O=Nmap Software LLC" not in subject:
+        return False, "Npcap 安装程序签发者不是 Nmap Software LLC"
+    return True, "数字签名有效，签发者为 Nmap Software LLC"
+
+
 def _check_file_integrity(path: str) -> tuple[bool, str]:
-    """快速检查下载文件是否完整（仅大小校验，不自带签名验证）。"""
+    """Check basic completeness and verify the publisher signature."""
     if not os.path.exists(path):
         return False, "文件不存在"
     size = os.path.getsize(path)
     if size <= 1_000_000:
         return False, f"文件过小（{size:,} bytes），下载可能不完整"
-    return True, f"文件大小 {size:,} bytes，通过完整性检查"
+    ok, signature_message = _check_authenticode_signature(path)
+    if not ok:
+        return False, signature_message
+    return True, f"文件大小 {size:,} bytes；{signature_message}"
 
 
 def download_npcap_installer(progress_cb=None) -> tuple[bool, str]:

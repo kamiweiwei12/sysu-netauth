@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import ctypes
 import tempfile
 import time
 import uuid
+from ctypes import wintypes
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +26,82 @@ COMMAND_DIR = APP_DIR / "commands"
 SERVICE_CACHE_PATH = APP_DIR / "service_cache.json"
 UPDATE_STATE_PATH = APP_DIR / "update_state.json"
 UI_STATE_PATH = APP_DIR / "ui_state.json"
+_DPAPI_ENTROPY = b"SYSUNetAuth/config-password/v1"
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _blob(data: bytes) -> tuple[_DataBlob, object]:
+    buffer = ctypes.create_string_buffer(data)
+    return (
+        _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))),
+        buffer,
+    )
+
+
+def _protect_password(password: str) -> str:
+    """Protect a password with Windows DPAPI for this machine.
+
+    The service runs as LocalSystem while the GUI runs in the interactive
+    administrator session, so machine scope is required.  The ProgramData
+    directory ACL remains the primary access boundary; DPAPI prevents the
+    credential from being stored as readable plaintext.
+    """
+    if not password:
+        return ""
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    plain, plain_buffer = _blob(password.encode("utf-8"))
+    entropy, entropy_buffer = _blob(_DPAPI_ENTROPY)
+    output = _DataBlob()
+    # Keep buffers alive for the duration of the native call.
+    _ = (plain_buffer, entropy_buffer)
+    if not crypt32.CryptProtectData(
+        ctypes.byref(plain),
+        "SYSU NetAuth credential",
+        ctypes.byref(entropy),
+        None,
+        None,
+        0x4,  # CRYPTPROTECT_LOCAL_MACHINE
+        ctypes.byref(output),
+    ):
+        raise ctypes.WinError()
+    try:
+        protected = ctypes.string_at(output.pbData, output.cbData)
+        return base64.b64encode(protected).decode("ascii")
+    finally:
+        kernel32.LocalFree(output.pbData)
+
+
+def _unprotect_password(encoded: str) -> str:
+    if not encoded:
+        return ""
+    try:
+        protected = base64.b64decode(encoded, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("invalid DPAPI password blob") from exc
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    encrypted, encrypted_buffer = _blob(protected)
+    entropy, entropy_buffer = _blob(_DPAPI_ENTROPY)
+    output = _DataBlob()
+    _ = (encrypted_buffer, entropy_buffer)
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(encrypted),
+        None,
+        ctypes.byref(entropy),
+        None,
+        None,
+        0,
+        ctypes.byref(output),
+    ):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(output.pbData, output.cbData).decode("utf-8")
+    finally:
+        kernel32.LocalFree(output.pbData)
 
 
 @dataclass
@@ -131,6 +210,12 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         return AppConfig()
     if not isinstance(raw, dict):
         return AppConfig()
+    protected_password = raw.get("password_dpapi")
+    if isinstance(protected_password, str) and protected_password:
+        try:
+            raw["password"] = _unprotect_password(protected_password)
+        except (OSError, ValueError, UnicodeError):
+            raw["password"] = ""
     # 读取必须是无副作用操作。GUI 和 Windows 服务都会频繁读取配置；
     # 若读取时也回写，两个进程会争用同一个目标文件并可能使服务崩溃。
     return _coerce_config(raw)
@@ -138,6 +223,9 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
 
 def save_config(config: AppConfig, path: Path = CONFIG_PATH) -> None:
     data = asdict(config)
+    password = str(data.pop("password", ""))
+    if password:
+        data["password_dpapi"] = _protect_password(password)
     if not data.get("last_success_mac"):
         data.pop("last_success_mac", None)
     _atomic_write_json(path, data)

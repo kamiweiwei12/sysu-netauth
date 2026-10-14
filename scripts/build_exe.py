@@ -227,6 +227,16 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Qt for Windows uses the Windows ICU shim.  PyInstaller can accidentally
+# collect an unrelated Poppler/Conda ICU from PATH, which shadows System32 and
+# makes PySide6.QtCore fail with ERROR_PROC_NOT_FOUND at runtime.
+a.binaries = [
+    item for item in a.binaries
+    if not (
+        item[0].replace('\\', '/').rsplit('/', 1)[-1].lower() == 'icuuc.dll'
+        or item[0].replace('\\', '/').rsplit('/', 1)[-1].lower().startswith('icudt')
+    )
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -274,6 +284,13 @@ service_a = Analysis(
     noarchive=False,
     optimize=0,
 )
+service_a.binaries = [
+    item for item in service_a.binaries
+    if not (
+        item[0].replace('\\', '/').rsplit('/', 1)[-1].lower() == 'icuuc.dll'
+        or item[0].replace('\\', '/').rsplit('/', 1)[-1].lower().startswith('icudt')
+    )
+]
 service_pyz = PYZ(service_a.pure)
 
 service_exe = EXE(
